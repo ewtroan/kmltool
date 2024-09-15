@@ -7,9 +7,14 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
+
+	exif "github.com/dsoprea/go-exif/v3"
+	exifcommon "github.com/dsoprea/go-exif/v3/common"
 )
 
-const DIR = "/home/ewt/Downloads/legs"
+const kmlDir = "/home/ewt/Downloads/legs"
+const imageDir = "/home/ewt/Downloads/images"
 
 type kmlFolder struct {
 	//XMLName xml.Name
@@ -38,10 +43,11 @@ type kmlLineStyle struct {
 }
 
 type kmlPlacemark struct {
-	Name       string          `xml:"name"`
-	Style      *kmlStyle       `xml:",omitempty"`
-	LineString []kmlLineString `xml:",omitempty"`
-	Point      *kmlPoint       `xml:",omitempty"`
+	Name        string          `xml:"name,omitempty"`
+	Description string          `xml:"description,omitempty"`
+	Style       *kmlStyle       `xml:",omitempty"`
+	LineString  []kmlLineString `xml:",omitempty"`
+	Point       *kmlPoint       `xml:",omitempty"`
 }
 
 type kmlPoint struct {
@@ -60,10 +66,18 @@ type kml struct {
 	Folder  kmlFolder `xml:"Folder"`
 }
 
-func buildKml() kml {
-	entries, err := os.ReadDir(DIR)
+type imageInfo struct {
+	File                string
+	Latitude, Longitude float64
+	Timestamp           time.Time
+}
+
+type imageSet []imageInfo
+
+func buildKml(dir string) kml {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		log.Fatalf("reading directory: %s", err)
+		log.Fatalf("reading directory %s: %s", dir, err)
 	}
 
 	var kmls []kml
@@ -72,7 +86,7 @@ func buildKml() kml {
 		if !strings.HasSuffix(entry.Name(), ".kml") {
 			continue
 		}
-		path := DIR + "/" + entry.Name()
+		path := dir + "/" + entry.Name()
 		r, err := os.Open(path)
 		if err != nil {
 			log.Fatalf("opening %s: %s", path, err)
@@ -134,8 +148,90 @@ func buildKml() kml {
 	return finalKml
 }
 
+func loadImages(dir string) imageSet {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		log.Fatalf("reading directory %s: %s", dir, err)
+	}
+
+	images := make([]imageInfo, 0, len(entries))
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if name[0:1] == "." {
+			continue
+		} else if !strings.HasSuffix(name, ".jpg") {
+			continue
+		}
+
+		path := dir + "/" + name
+		rawExif, err := exif.SearchFileAndExtractExif(path)
+		if err != nil {
+			log.Fatalf("reading exif from %s: %s", path, err)
+		}
+
+		im, _ := exifcommon.NewIfdMappingWithStandard()
+		ti := exif.NewTagIndex()
+
+		_, index, err := exif.Collect(im, ti, rawExif)
+		if err != nil {
+			log.Fatalf("collecing exif from %s: %s", path, err)
+		}
+
+		ifd, err := index.RootIfd.ChildWithIfdPath(exifcommon.IfdGpsInfoStandardIfdIdentity)
+		if err != nil {
+			log.Fatalf("finding identifb from %s: %s", path, err)
+		}
+
+		gi, err := ifd.GpsInfo()
+		if err != nil {
+			log.Fatalf("findind gps location from %s: %s", path, err)
+		}
+
+		images = append(images, imageInfo{
+			File:      name,
+			Latitude:  gi.Latitude.Decimal(),
+			Longitude: gi.Longitude.Decimal(),
+			Timestamp: gi.Timestamp,
+		})
+	}
+
+	return images
+}
+
+func (images imageSet) folder() kmlFolder {
+	f := kmlFolder{Name: "Photographs"}
+	f.Placemarks = make([]kmlPlacemark, 0, len(images))
+
+	icon := &kmlStyle{
+		IconStyle: &kmlIconStyle{
+			Icon: &kmlHref{
+				Href: "http://maps.google.com/mapfiles/kml/shapes/camera.png",
+			},
+		},
+	}
+
+	tz, _ := time.LoadLocation("Europe/Madrid")
+
+	for _, i := range images {
+		url := fmt.Sprintf("https://storage.googleapis.com/oot-photos-public/Camino-2024/%s", i.File)
+		scaledUrl := fmt.Sprintf("https://storage.googleapis.com/oot-photos-public/Camino-2024/scaled/%s", i.File)
+		description := fmt.Sprintf(`<p><a href="%s"><img src="%s"></a></p><p>%s</p>`, url, scaledUrl, i.Timestamp.In(tz).Format("Mon, 02 Jan 2006 15:04:05"))
+		//description = url
+		f.Placemarks = append(f.Placemarks, kmlPlacemark{
+			Description: description,
+			Point:       &kmlPoint{Coordinates: fmt.Sprintf("%f,%f", i.Longitude, i.Latitude)},
+			Style:       icon,
+		})
+	}
+
+	return f
+}
+
 func main() {
-	finalKml := buildKml()
+	finalKml := buildKml(kmlDir)
+	imageFolder := loadImages(imageDir).folder()
+	finalKml.Folder.Folders = append(finalKml.Folder.Folders, imageFolder)
 
 	if s, err := xml.MarshalIndent(finalKml, "", "    "); err != nil {
 		log.Fatalf("marshaling: %s", err)
